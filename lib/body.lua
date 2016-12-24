@@ -2,110 +2,165 @@
 -- HTTP request helpers
 --
 
-local Table = require('table')
+local Object = require('core').Object
+local Error = require('core').Error
+local HTTP = require('http')
 local parse_url = require('url').parse
-local parse_json = require('json').parse
-local parse_query = require('querystring').parse
+local parse_request = require('./body').parse_request
+local Cookie = require('./cookie').Cookie
 
 --
--- given string `body` and optional `content_type`,
--- try to compose table representing th body.
--- JSON/JSONP should be decoded, urlencoded data should be parsed
+-- HTTP request
 --
-local function parse_body(body, content_type, callback)
+local Curl = Object:extend()
 
-  local err
+-- default options
+Curl.defaults = {
+  proxy = false,
+  redirects = 10,
+  parse = true, -- whether to parse the response body
+}
 
-  --p('CTYPE', content_type)
-  -- allow optional content-type
-  if type(content_type) == 'function' then
-    callback = content_type
-    content_type = nil
+function Curl:initialize(options)
+  self.options = setmetatable(options or {}, { __index = Curl.defaults })
+end
+
+function Curl:request(callback)
+  -- parse URL
+  local parsed = self.options
+  if self.options.url then
+    parsed = parse_url(self.options.url)
+    setmetatable(parsed, { __index = self.options })
   end
-  if content_type then
-    content_type = content_type:match('([^;]+)')
+  -- collect HTTP request options
+  local params = {
+    host = parsed.hostname or parsed.host,
+    port = parsed.port,
+    path = parsed.pathname,-- .. parsed.search,
+    method = self.options.method,
+    headers = self.options.headers,
+  }
+  
+  --print(params.host, params.port, params.path, params.method, params.headers)
+
+  -- honor proxy, if any
+  local proxy = self.options.proxy
+  -- proxy can be string which is used verbatim,
+  -- or boolean true to use system proxy
+  if proxy == true then
+    proxy = process.env[parsed.protocol .. '_proxy']
+  end
+  -- proxying means...
+  if proxy then
+    -- ...request the proxy host
+    parsed = parse_url(proxy)
+    params.host = parsed.hostname or parsed.host
+    params.port = parsed.port
+    -- ...with path equal to original URL
+    params.path = self.options.url
   end
 
-  -- first char allows to distinguish JSON
-  local char = body:sub(1, 1)
-  -- JSON?
-  if char == '[' or char == '{' then
-    -- try to decode JSON
-    local status, result = pcall(parse_json, body, {
-      use_null = true,
-      --allow_comments = true,
-      --dont_validate_strings = true,
-      --allow_trailing_garbage = true,
-      --allow_multiple_values = true,
-      --allow_partial_values = true,
-    })
-    if status then
-      body = result
-    else
-      err = result
-    end
-  -- JSONP?
-  elseif content_type == 'application/javascript' then
-    -- extract JSON payload
-    local func, json = body:match('^([%w_][%a_]*)%((.+)%);?$')
-    -- try to decode JSON
-    if func and json then
-      local status, result = pcall(parse_json, json, {
-        use_null = true,
-      })
-      if status then
-        body = result
-        -- TODO: how to report `func`?
+  --p('PARAMS', params)
+  --TODO: set Content-Length: if options.data
+  -- no longer todo
+  
+  if self.options.data then
+		if not params.headers then
+			params.headers = {}
+		end
+		table.insert(params.headers, {"Content-Length", #tostring(self.options.data)})
+  end
+
+  -- issue the request
+  local req
+  req = HTTP.request(params, function (res)
+    local st = res.statusCode
+    -- handle redirect
+    if st > 300 and st < 400 and res.headers.location then
+      -- can follow new location?
+      if self.options.redirects and self.options.redirects > 0 then
+        -- FIXME: spoils original options. make it feature? ;)
+        self.options.redirects = self.options.redirects - 1
+        self.options.url = res.headers.location
+        -- for short redirects (RFC2616 compliant?) prepend current host name
+        if not parse_url(self.options.url).host then
+          self.options.url = parsed.protocol .. '://' .. parsed.host .. self.options.url
+        end
+        -- request redirected location
+--p('ST', options)
+        self:request(callback)
+        return
+      -- can't follow
       else
-        err = result
+        -- FIXME: what to do? so far let's think it's ok, proceed to data parsing
+        --callback(nil)
       end
+    -- report HTTP errors
+    elseif st >= 400 then
+      err = Error:new(data)
+      -- FIXME: should reuse status_code_message from Response?
+      err.code = st
+      callback(err)
+      return
     end
-  -- html?
-  elseif char == '<' then
-    -- nothing needed
-  -- analyze content-type
-  else
-    if     content_type == 'application/www-urlencoded'
-        or content_type == 'application/x-www-form-urlencoded'
-    then
-      -- try to parse urlencoded
-      body = parse_query(body)
-    end
-  end
 
-  --
-  if callback then
-    callback(err, body)
-  else
-    return body
-  end
+    -- request was ok
+
+    -- to parse or not to parse the response
+    if self.options.parse then
+      -- parse the response
+      parse_request(res, callback)
+    else
+      -- just return the connected request
+      callback(nil, res)
+    end
+
+  end)
+
+  -- purge issued request
+  req:once('end', function ()
+    --req:close()
+  end)
+
+  -- pipe errors to callback
+  req:once('error', function (err)
+    req:destroy()
+    callback(err)
+    callback = function () end
+  end)
+
+  return req
 
 end
 
---
--- given a stream `req`, try to drain pending data and parse it.
--- useful for both outgoing and incoming requests
---
-local function parse_request(req, callback)
+function Curl:finish(data)
+end
 
-  -- collect data
-  local body = { }
-  local length = 0
-  req:on('data', function (chunk, len)
-    length = length + 1
-    body[length] = chunk
-  end)
+local function get(options, callback)
+  local curl = Curl:new(options)
+  curl.options.method = 'GET'
+  local req = curl:request(callback)
+  req:done()
+  --req:close()
+  --??req._handle:shutdown()
+end
 
-  -- parse data, try to honor Content-Type:
-  req:on('end', function ()
---p('PARSE', req)
-    parse_body(Table.concat(body), req.headers['content-type'], callback)
-  end)
-
+local function post(options, data, callback)
+  local curl = Curl:new(options)
+  curl.options.method = 'POST'
+  curl.options.data = data
+  local req = curl:request(callback)
+  if type(data) == 'string' then
+    req:write(data)
+  end
+  req:done()
+  --req:close()
 end
 
 -- module
 return {
-  parse_body = parse_body,
-  parse_request = parse_request,
+  Curl = Curl,
+  get = get,
+  post = post,
+  Cookie = Cookie
 }
