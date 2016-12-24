@@ -14,8 +14,3 @@ get({
   -- should see pretty-printed table of one or two records here
 end)
 ```
-
-License
------
-
-[MIT](luvit-curl/license.txt)
