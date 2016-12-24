@@ -1,9 +1,6 @@
-Curl
-=====
+Originally not mine(https://github.com/dvv/luvit-curl)
+I modified to work with the current version of lvit
 
-A library to ease making HTTP requests and parse responses
-
-Usage
 -----
 
 ```lua
